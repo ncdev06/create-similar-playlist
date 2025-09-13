@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+*.egg
+
+# Virtual env
+.venv/
+env/
+venv/
+
+# Data / cache
+data/indexes/
+data/cache/
+*.npy
+
+# OS
+.DS_Store
+
+# Streamlit
+.streamlit/
