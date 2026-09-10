@@ -11,10 +11,14 @@ __pycache__/
 env/
 venv/
 
-# Data / cache
-data/indexes/
-data/cache/
+# Secrets / OAuth
+.env
+.env.*
 .cache
+.streamlit/secrets.toml
+
+# Data / cache
+data/
 *.npy
 
 # OS
