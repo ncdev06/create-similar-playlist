@@ -1,111 +1,112 @@
-# Create Similar Playlist
+# Create Similar Playlist · 2026
 
-A Spotify recommendation app that builds playlists from **audio-feature similarity** using the Spotify Web API, NumPy/Pandas, and approximate nearest-neighbor search.
+A hybrid music recommender rebuilt for the 2026 API landscape.
 
-## Why this project is interesting
-Instead of relying on genre labels alone, the system represents tracks with normalized audio features, builds a searchable vector index, and recommends songs that are close to a target playlist in feature space. A multi-pass reranker then trades off similarity with playlist diversity.
+The original version depended heavily on Spotify Audio Features, Recommendations, and Related Artists. Those APIs are no longer a dependable foundation for a public Development Mode app, so this version removes them completely.
 
-## Key Features
-- Builds a candidate corpus from public Spotify playlists and related tracks.
-- Computes and normalizes track feature vectors for similarity search.
-- Uses **FAISS HNSW** when available, with a **scikit-learn cosine nearest-neighbor fallback**.
-- Represents an input playlist using the mean of its track vectors.
-- Retrieves a wide candidate pool, removes seed tracks, and reranks results with artist-diversity and explicit-content constraints.
-- Lets users create the generated playlist directly in their Spotify account through a **Streamlit** interface.
-- Includes a cloud-ready OAuth flow in `streamlit_app.py` so the deployed app can be opened from a phone, tablet, or computer.
+## 2026 Architecture
 
-## Tech Stack
-- **Python**
-- **NumPy / Pandas**
-- **FAISS**
-- **scikit-learn**
-- **Spotipy / Spotify Web API**
-- **Streamlit**
-
-## Architecture
 ```text
-Spotify playlist
-      |
-Candidate-corpus expansion
-      |
-Feature extraction + normalization
-      |
-FAISS HNSW / cosine-NN index
-      |
-Playlist-vector query
-      |
-Candidate retrieval
-      |
-Diversity-aware reranking
-      |
-Streamlit results + Spotify playlist creation
+Seed tracks entered by the user
+        |
+Last.fm collaborative similarity
+        |
+Multi-seed reciprocal-rank fusion
+        |
+Last.fm tags -> TF-IDF content vectors
+        |
+Hybrid relevance score
+        |
+MMR-style diversity reranking
+        |
+Optional Spotify search + playlist export
 ```
 
-## Repository Structure
-```text
-streamlit_app.py       # cloud-ready entrypoint + Spotify OAuth
-src/
-├── config.py           # local configuration and environment variables
-├── corpus_builder.py   # expands the candidate track corpus
-├── features.py         # feature extraction and matrix construction
-├── indexer.py          # FAISS HNSW / sklearn nearest-neighbor index
-├── recommender.py      # playlist vector, retrieval, and reranking logic
-├── spotify_client.py   # local Spotify OAuth client
-└── ui_app.py           # original local Streamlit interface
-```
+## What Makes v2 Better
 
-## Deploy on Streamlit Community Cloud
-This project is already prepared for Streamlit Community Cloud. This is the recommended host for the current Streamlit architecture.
+- **No deprecated Spotify recommendation endpoints.** Recommendation quality no longer depends on Spotify Audio Features, Recommendations, or Related Artists.
+- **Hybrid recommendation.** Combines collaborative similarity, tag-based content similarity, and evidence across multiple seed tracks.
+- **Reciprocal-rank fusion.** Candidates supported by multiple seeds receive stronger ranking evidence.
+- **TF-IDF tag representation.** Music tags are converted into content vectors for a lightweight, interpretable similarity signal.
+- **MMR-style diversification.** Final ranking penalizes repetitive results and enforces an artist cap.
+- **Explainable scoring.** The UI exposes collaborative similarity, tag similarity, and seed coverage for every recommendation.
+- **2026 Spotify integration.** Spotify is optional and only used for track lookup and playlist export through currently supported endpoints.
+- **Cloud-friendly.** No local FAISS index, no persistent token cache, and no dependency on machine-local files.
 
-1. Go to https://share.streamlit.io and sign in with GitHub.
-2. Create a new app from `ncdev06/create-similar-playlist`.
-3. Choose branch `main` and entrypoint `streamlit_app.py`.
-4. Pick a permanent app URL before configuring Spotify OAuth.
-5. In the Spotify Developer Dashboard, add that exact deployed URL as a Redirect URI.
-6. In the Streamlit app's **Settings → Secrets**, add:
+## Stack
 
-```toml
-SPOTIFY_CLIENT_ID = "your_client_id"
-SPOTIFY_CLIENT_SECRET = "your_client_secret"
-SPOTIFY_REDIRECT_URI = "https://YOUR-APP.streamlit.app/"
-```
-
-7. Save the secrets, reboot the app, and click **Connect Spotify**.
-
-The deployed URL is accessible from any modern browser, including mobile devices. Spotify Development Mode may still restrict which Spotify accounts are allowed to authenticate.
-
-## Spotify Development Mode limitations
-Spotify has restricted several Web API capabilities used by this project, including Audio Features, Recommendations, and Related Artists for many Development Mode apps. If your Spotify developer app does not have access to those endpoints, the similarity-index build step will not work even though deployment itself succeeds.
-
-Development Mode is also intended for personal/testing use and limits the number of authorized users. For a portfolio demo, the safest setup is to keep your own Spotify account and a few testers allowlisted in the Spotify Developer Dashboard.
+- Python
+- Streamlit
+- Last.fm API
+- scikit-learn
+- TF-IDF + cosine similarity
+- Reciprocal-rank fusion
+- MMR-style reranking
+- RapidFuzz
+- Spotify Web API / Spotipy 2.26
 
 ## Run Locally
 
-### 1. Clone and install
 ```bash
 git clone https://github.com/ncdev06/create-similar-playlist.git
 cd create-similar-playlist
 pip install -r requirements.txt
-```
-
-### 2. Configure Spotify credentials
-Create a `.env` file:
-
-```env
-SPOTIFY_CLIENT_ID=your_client_id
-SPOTIFY_CLIENT_SECRET=your_client_secret
-SPOTIFY_REDIRECT_URI=http://127.0.0.1:8501
-```
-
-### 3. Start the original local app
-```bash
-streamlit run src/ui_app.py
-```
-
-Or test the cloud-ready OAuth entrypoint locally:
-```bash
 streamlit run streamlit_app.py
 ```
 
-## Notes
-FAISS is included for deployment. If it cannot load on a platform, the project falls back to scikit-learn nearest-neighbor search using cosine distance.
+Create a `.env` file:
+
+```env
+LASTFM_API_KEY=your_lastfm_api_key
+SPOTIFY_CLIENT_ID=your_spotify_client_id
+SPOTIFY_CLIENT_SECRET=your_spotify_client_secret
+SPOTIFY_REDIRECT_URI=http://127.0.0.1:8501/
+```
+
+Only `LASTFM_API_KEY` is required for recommendations. Spotify credentials are optional unless you want Spotify matching and playlist export.
+
+## Deploy on Streamlit Community Cloud
+
+1. Connect this GitHub repository to Streamlit Community Cloud.
+2. Set the main file to `streamlit_app.py`.
+3. Add secrets in the Streamlit app settings:
+
+```toml
+LASTFM_API_KEY = "..."
+SPOTIFY_CLIENT_ID = "..."
+SPOTIFY_CLIENT_SECRET = "..."
+SPOTIFY_REDIRECT_URI = "https://YOUR-APP.streamlit.app/"
+```
+
+4. Add the exact same redirect URL to the Spotify Developer Dashboard.
+5. If your Spotify app is in Development Mode, add your own Spotify account to the app allowlist before testing export.
+
+## Important Spotify Note
+
+Spotify Development Mode changed substantially in 2026. This project intentionally treats Spotify as an optional output layer rather than the recommendation engine. That keeps the recommender functional even when Spotify limits access to recommendation-specific endpoints.
+
+## Security
+
+Do not commit API keys, Spotify client secrets, OAuth tokens, `.env` files, or Streamlit secrets. The repository ignores local auth/cache artifacts.
+
+## Project Structure
+
+```text
+streamlit_app.py       # cloud-ready UI + optional Spotify OAuth/export
+src/
+├── lastfm_client.py   # candidate discovery + track tags
+├── ranking.py         # hybrid scoring + diversity reranking
+└── __init__.py
+```
+
+## Recommendation Formula
+
+The base score combines:
+
+- **60% collaborative similarity** from Last.fm similar-track evidence
+- **25% tag similarity** from TF-IDF/cosine similarity
+- **15% seed coverage** across the user's input tracks
+
+The final list then applies an MMR-style redundancy penalty and a configurable maximum number of tracks per artist.
+
+This makes the recommender more explainable and more robust than the original single-vector nearest-neighbor version while remaining lightweight enough to run as a public portfolio demo.
