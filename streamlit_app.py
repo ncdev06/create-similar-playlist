@@ -7,10 +7,10 @@ import os
 import secrets
 import time
 from concurrent.futures import ThreadPoolExecutor
+from difflib import SequenceMatcher
 
 import spotipy
 import streamlit as st
-from rapidfuzz import fuzz
 from spotipy.oauth2 import SpotifyOAuth
 
 from src.lastfm_client import LastFMClient, LastFMError, TrackRef
@@ -142,6 +142,18 @@ def recommend(seeds, count, max_artist, diversity):
     return rank_candidates(seeds, tracks, collab, coverage, tags, count, max_artist, diversity)
 
 
+def _text_similarity(left, right):
+    left = " ".join(str(left).casefold().split())
+    right = " ".join(str(right).casefold().split())
+    if not left or not right:
+        return 0.0
+    sequence = SequenceMatcher(None, left, right).ratio()
+    left_words, right_words = set(left.split()), set(right.split())
+    union = left_words | right_words
+    token_overlap = len(left_words & right_words) / len(union) if union else 0.0
+    return 100.0 * (0.75 * sequence + 0.25 * token_overlap)
+
+
 def spotify_match(sp, track):
     q = f'track:"{track.title}" artist:"{track.artist}"'
     items = sp.search(q=q, type="track", limit=5).get("tracks", {}).get("items", [])
@@ -150,7 +162,7 @@ def spotify_match(sp, track):
         artists = item.get("artists") or [{}]
         artist = artists[0].get("name", "")
         title = item.get("name", "")
-        score = 0.68 * fuzz.token_set_ratio(track.title, title) + 0.32 * fuzz.token_set_ratio(track.artist, artist)
+        score = 0.68 * _text_similarity(track.title, title) + 0.32 * _text_similarity(track.artist, artist)
         if score > best_score:
             best_score, best = score, item
     return best if best_score >= 72 else None
@@ -255,4 +267,4 @@ if recs:
                     st.error(f"Spotify export failed: {exc}")
 
 st.markdown("---")
-st.caption("Python · Streamlit · Last.fm API · scikit-learn · TF-IDF · cosine similarity · reciprocal-rank fusion · MMR · Spotify Web API")
+st.caption("Python · Streamlit · Last.fm API · hybrid ranking · cosine similarity · reciprocal-rank fusion · MMR · Spotify Web API")
