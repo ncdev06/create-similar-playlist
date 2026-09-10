@@ -6,23 +6,20 @@ import hmac
 import os
 import secrets
 import time
+from concurrent.futures import ThreadPoolExecutor
 
-import numpy as np
 import spotipy
 import streamlit as st
+from rapidfuzz import fuzz
 from spotipy.oauth2 import SpotifyOAuth
 
-from src.corpus_builder import expand_corpus_from_playlist
-from src.features import build_feature_matrix, to_matrix
-from src.indexer import save_index
-from src.recommender import recommend_for_playlist
-
+from src.lastfm_client import LastFMClient, LastFMError, TrackRef
+from src.ranking import build_scores, rank_candidates
 
 st.set_page_config(page_title="Create Similar Playlist", page_icon="🎧", layout="wide")
 
 
-def get_secret(name: str, default: str | None = None) -> str | None:
-    """Read from Streamlit Cloud secrets first, then environment variables."""
+def secret(name, default=None):
     try:
         value = st.secrets.get(name)
         if value:
@@ -32,36 +29,31 @@ def get_secret(name: str, default: str | None = None) -> str | None:
     return os.getenv(name, default)
 
 
-CLIENT_ID = get_secret("SPOTIFY_CLIENT_ID") or get_secret("SPOTIPY_CLIENT_ID")
-CLIENT_SECRET = get_secret("SPOTIFY_CLIENT_SECRET") or get_secret("SPOTIPY_CLIENT_SECRET")
-REDIRECT_URI = get_secret("SPOTIFY_REDIRECT_URI") or get_secret("SPOTIPY_REDIRECT_URI")
-SCOPES = "playlist-read-private playlist-modify-public playlist-modify-private user-read-private"
+LASTFM_API_KEY = secret("LASTFM_API_KEY")
+CLIENT_ID = secret("SPOTIFY_CLIENT_ID")
+CLIENT_SECRET = secret("SPOTIFY_CLIENT_SECRET")
+REDIRECT_URI = secret("SPOTIFY_REDIRECT_URI")
+SCOPES = "playlist-modify-public playlist-modify-private"
 
 
-def _make_state(secret: str) -> str:
+def make_state(key):
     payload = f"{int(time.time())}:{secrets.token_urlsafe(16)}"
-    signature = hmac.new(secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
-    raw = f"{payload}:{signature}".encode()
-    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+    sig = hmac.new(key.encode(), payload.encode(), hashlib.sha256).hexdigest()
+    return base64.urlsafe_b64encode(f"{payload}:{sig}".encode()).decode().rstrip("=")
 
 
-def _valid_state(value: str | None, secret: str, max_age_seconds: int = 900) -> bool:
-    if not value:
-        return False
+def valid_state(value, key):
     try:
-        padded = value + "=" * (-len(value) % 4)
-        decoded = base64.urlsafe_b64decode(padded.encode()).decode()
-        timestamp, nonce, signature = decoded.split(":", 2)
-        payload = f"{timestamp}:{nonce}"
-        expected = hmac.new(secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
-        if not hmac.compare_digest(signature, expected):
-            return False
-        return 0 <= time.time() - int(timestamp) <= max_age_seconds
+        raw = base64.urlsafe_b64decode((value + "=" * (-len(value) % 4)).encode()).decode()
+        stamp, nonce, sig = raw.split(":", 2)
+        payload = f"{stamp}:{nonce}"
+        expected = hmac.new(key.encode(), payload.encode(), hashlib.sha256).hexdigest()
+        return hmac.compare_digest(sig, expected) and 0 <= time.time() - int(stamp) <= 900
     except Exception:
         return False
 
 
-def _oauth(state: str | None = None) -> SpotifyOAuth:
+def oauth(state=None):
     return SpotifyOAuth(
         client_id=CLIENT_ID,
         client_secret=CLIENT_SECRET,
@@ -74,185 +66,193 @@ def _oauth(state: str | None = None) -> SpotifyOAuth:
     )
 
 
-def spotify_client() -> spotipy.Spotify:
-    if not CLIENT_ID or not CLIENT_SECRET or not REDIRECT_URI:
-        st.error(
-            "Spotify credentials are not configured. Add SPOTIFY_CLIENT_ID, "
-            "SPOTIFY_CLIENT_SECRET, and SPOTIFY_REDIRECT_URI to your deployment secrets."
-        )
-        st.stop()
+def spotify_client():
+    if not (CLIENT_ID and CLIENT_SECRET and REDIRECT_URI):
+        return None
 
     code = st.query_params.get("code")
     returned_state = st.query_params.get("state")
-    error = st.query_params.get("error")
-
-    if error:
-        st.error(f"Spotify authorization failed: {error}")
-        st.query_params.clear()
-        st.stop()
-
     if code and "spotify_token" not in st.session_state:
-        if not _valid_state(returned_state, CLIENT_SECRET):
-            st.error("Spotify login could not be verified. Please try connecting again.")
+        if not valid_state(str(returned_state or ""), CLIENT_SECRET):
+            st.error("Spotify login could not be verified. Reconnect and try again.")
             st.query_params.clear()
-            st.stop()
-
+            return None
         try:
-            token_info = _oauth().get_access_token(code, as_dict=True, check_cache=False)
-            st.session_state["spotify_token"] = token_info
+            token = oauth().get_access_token(str(code), as_dict=True, check_cache=False)
+            st.session_state["spotify_token"] = token
             st.query_params.clear()
             st.rerun()
         except Exception as exc:
-            st.error(f"Could not finish Spotify login: {exc}")
-            st.stop()
+            st.error(f"Spotify login failed: {exc}")
+            return None
 
-    token_info = st.session_state.get("spotify_token")
-    if not token_info:
-        state = _make_state(CLIENT_SECRET)
-        auth_url = _oauth(state=state).get_authorize_url()
-        st.title("🎧 Create Similar Playlist")
-        st.write(
-            "Generate a new playlist from the musical profile of one of your Spotify playlists."
-        )
-        st.link_button("Connect Spotify", auth_url, type="primary")
-        st.caption("Spotify authorization is required to read playlist items and create a playlist in your account.")
-        st.stop()
+    token = st.session_state.get("spotify_token")
+    if not token:
+        return None
+    auth = oauth()
+    if auth.is_token_expired(token):
+        token = auth.refresh_access_token(token["refresh_token"])
+        st.session_state["spotify_token"] = token
+    return spotipy.Spotify(auth=token["access_token"], requests_timeout=15, retries=2)
 
-    oauth = _oauth()
-    if oauth.is_token_expired(token_info):
+
+def parse_seeds(text):
+    out, seen = [], set()
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        pair = None
+        for sep in (" — ", " – ", " | ", " - "):
+            if sep in line:
+                pair = line.split(sep, 1)
+                break
+        if not pair:
+            continue
+        artist, title = pair[0].strip(), pair[1].strip()
+        track = TrackRef(artist, title)
+        if artist and title and track.key not in seen:
+            seen.add(track.key)
+            out.append(track)
+    return out[:8]
+
+
+def recommend(seeds, count, max_artist, diversity):
+    client = LastFMClient(LASTFM_API_KEY)
+    with ThreadPoolExecutor(max_workers=min(6, len(seeds))) as pool:
+        rows = list(pool.map(lambda s: client.similar_tracks(s, limit=45), seeds))
+    similar = {seed.key: row for seed, row in zip(seeds, rows)}
+    tracks, collab, coverage = build_scores(seeds, similar)
+    if not tracks:
+        raise RuntimeError("No candidates found. Try different seed tracks.")
+
+    pool_tracks = sorted(
+        tracks.values(),
+        key=lambda t: (collab.get(t.key, 0), coverage.get(t.key, 0)),
+        reverse=True,
+    )[: max(40, count * 2)]
+    keep = {t.key for t in pool_tracks}
+    tracks = {k: v for k, v in tracks.items() if k in keep}
+    collab = {k: v for k, v in collab.items() if k in keep}
+    coverage = {k: v for k, v in coverage.items() if k in keep}
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        tag_rows = list(pool.map(lambda t: client.top_tags(t, limit=12), seeds + pool_tracks))
+    tags = {t.key: row for t, row in zip(seeds + pool_tracks, tag_rows)}
+    return rank_candidates(seeds, tracks, collab, coverage, tags, count, max_artist, diversity)
+
+
+def spotify_match(sp, track):
+    q = f'track:"{track.title}" artist:"{track.artist}"'
+    items = sp.search(q=q, type="track", limit=5).get("tracks", {}).get("items", [])
+    best, best_score = None, 0.0
+    for item in items:
+        artists = item.get("artists") or [{}]
+        artist = artists[0].get("name", "")
+        title = item.get("name", "")
+        score = 0.68 * fuzz.token_set_ratio(track.title, title) + 0.32 * fuzz.token_set_ratio(track.artist, artist)
+        if score > best_score:
+            best_score, best = score, item
+    return best if best_score >= 72 else None
+
+
+st.title("🎧 Create Similar Playlist · 2026")
+st.write("A hybrid music recommender rebuilt around APIs that still work in 2026.")
+st.caption("Last.fm collaborative similarity → TF-IDF tag profile → reciprocal-rank fusion → MMR-style diversity reranking → optional Spotify export")
+
+with st.sidebar:
+    st.subheader("What changed")
+    st.write("The old version depended on Spotify Audio Features, Recommendations, and Related Artists. This version removes those dependencies completely.")
+    st.write("Spotify is now optional and only used to find final tracks and save a playlist.")
+
+if not LASTFM_API_KEY:
+    st.error("Add LASTFM_API_KEY to your deployment secrets to run recommendations.")
+    st.stop()
+
+left, right = st.columns([3, 2])
+with left:
+    seed_text = st.text_area(
+        "Seed tracks — one per line as Artist — Track",
+        height=180,
+        placeholder="Tame Impala — The Less I Know the Better\nDaft Punk — Instant Crush\nMGMT — Electric Feel",
+    )
+with right:
+    count = st.slider("Playlist size", 10, 30, 20, 5)
+    max_artist = st.slider("Max tracks per artist", 1, 4, 2)
+    diversity = st.slider("Diversity strength", 0.00, 0.35, 0.18, 0.01)
+
+if st.button("Generate recommendations", type="primary"):
+    seeds = parse_seeds(seed_text)
+    if not seeds:
+        st.error("Use the format `Artist — Track` for at least one seed.")
+    else:
         try:
-            token_info = oauth.refresh_access_token(token_info["refresh_token"])
-            st.session_state["spotify_token"] = token_info
-        except Exception:
-            st.session_state.pop("spotify_token", None)
+            with st.spinner("Building your recommendation set..."):
+                st.session_state["recs"] = recommend(seeds, count, max_artist, diversity)
+                st.session_state.pop("spotify_matches", None)
+        except (LastFMError, RuntimeError, ValueError) as exc:
+            st.error(str(exc))
+
+recs = st.session_state.get("recs", [])
+if recs:
+    st.markdown("---")
+    st.subheader("Recommendations")
+    matches = st.session_state.get("spotify_matches", {})
+    for i, item in enumerate(recs, 1):
+        with st.container(border=True):
+            c1, c2 = st.columns([5, 1])
+            with c1:
+                st.markdown(f"**{i}. {item.track.title}**  \n{item.track.artist}")
+                if item.tags:
+                    st.caption(" · ".join(item.tags[:6]))
+                if item.track.url:
+                    st.link_button("Last.fm", item.track.url)
+                match = matches.get(item.track.key)
+                if match:
+                    url = (match.get("external_urls") or {}).get("spotify")
+                    if url:
+                        st.link_button("Open in Spotify", url)
+            with c2:
+                st.metric("score", f"{round(item.score * 100)}%")
+                st.caption(f"similarity {item.collaborative_score:.2f}\ntags {item.tag_score:.2f}\ncoverage {item.seed_coverage:.2f}")
+
+    st.markdown("### Spotify export")
+    sp = spotify_client()
+    if sp is None and CLIENT_ID and CLIENT_SECRET and REDIRECT_URI:
+        login = oauth(make_state(CLIENT_SECRET)).get_authorize_url()
+        st.link_button("Connect Spotify to save playlist", login)
+        st.caption("Spotify Development Mode only allows accounts added to your app's allowlist.")
+    elif sp is not None:
+        if st.button("Match recommendations to Spotify"):
+            mapped = {}
+            progress = st.progress(0)
+            for idx, item in enumerate(recs, 1):
+                try:
+                    match = spotify_match(sp, item.track)
+                except Exception:
+                    match = None
+                if match:
+                    mapped[item.track.key] = match
+                progress.progress(idx / len(recs))
+            st.session_state["spotify_matches"] = mapped
+            st.success(f"Matched {len(mapped)} of {len(recs)} tracks to Spotify.")
             st.rerun()
 
-    return spotipy.Spotify(auth=token_info["access_token"], requests_timeout=20, retries=2)
-
-
-sp = spotify_client()
-
-st.title("🎧 Create Similar Playlist")
-st.write(
-    "Build a candidate index from one of your playlists, then generate a new playlist using "
-    "feature similarity plus a diversity-aware reranker."
-)
-
-header_left, header_right = st.columns([5, 1])
-with header_right:
-    if st.button("Disconnect"):
-        st.session_state.clear()
-        st.query_params.clear()
-        st.rerun()
-
-with st.expander("1 · Build / refresh candidate index", expanded=True):
-    playlist_seed = st.text_input(
-        "Spotify playlist URL",
-        placeholder="https://open.spotify.com/playlist/...",
-        help="With Spotify Development Mode, use a playlist owned by or shared with your authorized Spotify account.",
-    )
-
-    if st.button("Build index", type="primary"):
-        if not playlist_seed.strip():
-            st.error("Paste a Spotify playlist URL first.")
-        else:
-            try:
-                with st.spinner("Reading playlist and expanding the candidate set..."):
-                    all_ids, stats = expand_corpus_from_playlist(sp, playlist_seed.strip(), limit_per_seed=80)
-
-                if not all_ids:
-                    st.error(
-                        "No playlist tracks were returned. Check that the playlist belongs to (or is collaborative with) "
-                        "the Spotify account you authorized and that your Spotify developer app has access."
-                    )
-                else:
-                    st.caption(
-                        f"Seed tracks: {stats.get('seed_tracks', 0)} · "
-                        f"Candidate tracks: {len(all_ids)}"
-                    )
-
-                    with st.spinner("Computing features and building the similarity index..."):
-                        df = build_feature_matrix(sp, all_ids)
-                        X = to_matrix(df)
-                        if X.size == 0:
-                            raise RuntimeError("Spotify returned no usable track features.")
-                        X = X / (np.linalg.norm(X, axis=1, keepdims=True) + 1e-8)
-                        save_index(X.astype("float32"), df["id"].tolist())
-
-                    st.session_state["index_ready"] = True
-                    st.session_state["index_seed"] = playlist_seed.strip()
-                    st.success(f"Index ready with {len(df)} tracks.")
-            except Exception as exc:
-                st.error(f"Could not build the index: {exc}")
-                st.info(
-                    "Spotify has restricted several recommendation/audio-feature endpoints for many Development Mode apps. "
-                    "If this works locally with your existing Spotify app but not with a new app, use the same Spotify app credentials."
-                )
+        matches = st.session_state.get("spotify_matches", {})
+        if matches:
+            name = st.text_input("Playlist name", "Create Similar Playlist · 2026")
+            public = st.checkbox("Public playlist", True)
+            if st.button("Create playlist in Spotify", type="primary"):
+                uris = [matches[x.track.key]["uri"] for x in recs if x.track.key in matches]
+                try:
+                    playlist = sp.current_user_playlist_create(name=name, public=public, description="Generated with hybrid collaborative + tag-based recommendation and diversity reranking.")
+                    sp.playlist_add_items(playlist["id"], uris)
+                    st.success(f"Created playlist with {len(uris)} tracks.")
+                    url = (playlist.get("external_urls") or {}).get("spotify")
+                    if url:
+                        st.link_button("Open playlist", url)
+                except Exception as exc:
+                    st.error(f"Spotify export failed: {exc}")
 
 st.markdown("---")
-
-with st.expander("2 · Generate a similar playlist", expanded=True):
-    target_playlist = st.text_input(
-        "Target playlist URL",
-        key="target_playlist",
-        placeholder="https://open.spotify.com/playlist/...",
-    )
-    k = st.slider("Number of recommendations", min_value=10, max_value=100, value=30, step=5)
-    max_per_artist = st.slider("Maximum tracks per artist", min_value=1, max_value=5, value=3)
-    allow_explicit = st.checkbox("Allow explicit tracks", value=True)
-
-    if st.button("Generate recommendations"):
-        if not target_playlist.strip():
-            st.error("Paste a target playlist URL first.")
-        elif not st.session_state.get("index_ready"):
-            st.warning("Build the candidate index first.")
-        else:
-            try:
-                with st.spinner("Finding similar tracks..."):
-                    rec_ids = recommend_for_playlist(
-                        sp,
-                        target_playlist.strip(),
-                        k=k,
-                        max_per_artist=max_per_artist,
-                        allow_explicit=allow_explicit,
-                    )
-                st.session_state["rec_ids"] = rec_ids
-            except Exception as exc:
-                st.error(f"Could not generate recommendations: {exc}")
-
-    rec_ids = st.session_state.get("rec_ids", [])
-    if rec_ids:
-        st.success(f"Found {len(rec_ids)} recommendations.")
-        try:
-            tracks = sp.tracks(rec_ids).get("tracks", [])
-        except Exception:
-            tracks = []
-
-        if tracks:
-            cols = st.columns(4)
-            for i, track in enumerate(tracks):
-                if not track:
-                    continue
-                with cols[i % 4]:
-                    images = (track.get("album") or {}).get("images") or []
-                    if images:
-                        st.image(images[min(1, len(images) - 1)]["url"], use_container_width=True)
-                    artists = track.get("artists") or [{}]
-                    st.caption(f"{track.get('name', 'Unknown')} — {artists[0].get('name', 'Unknown')}")
-
-        if st.button("Create playlist in Spotify", type="primary"):
-            try:
-                me = sp.current_user()
-                name = "Similar Playlist · Create Similar Playlist"
-                new_playlist = sp.user_playlist_create(me["id"], name=name, public=True)
-                sp.playlist_add_items(new_playlist["id"], rec_ids)
-                playlist_url = (new_playlist.get("external_urls") or {}).get("spotify")
-                st.success("Playlist created in Spotify.")
-                if playlist_url:
-                    st.link_button("Open playlist in Spotify", playlist_url)
-            except Exception as exc:
-                st.error(f"Could not create the Spotify playlist: {exc}")
-
-st.caption(
-    "Portfolio project · Python · Streamlit · Spotify Web API · FAISS / scikit-learn nearest-neighbor search"
-)
+st.caption("Python · Streamlit · Last.fm API · scikit-learn · TF-IDF · cosine similarity · reciprocal-rank fusion · MMR · Spotify Web API")
