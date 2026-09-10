@@ -168,17 +168,18 @@ def spotify_match(sp, track):
     return best if best_score >= 72 else None
 
 
-st.title("🎧 Create Similar Playlist · 2026")
-st.write("A hybrid music recommender rebuilt around APIs that still work in 2026.")
-st.caption("Last.fm collaborative similarity → TF-IDF tag profile → reciprocal-rank fusion → MMR-style diversity reranking → optional Spotify export")
+st.title("🎧 Create Similar Playlist")
+st.write("Start with a few songs you love and discover a fresh playlist built around their shared sound and style.")
+st.caption("Collaborative similarity · music-tag matching · multi-seed ranking · diversity reranking · optional Spotify export")
 
 with st.sidebar:
-    st.subheader("What changed")
-    st.write("The old version depended on Spotify Audio Features, Recommendations, and Related Artists. This version removes those dependencies completely.")
-    st.write("Spotify is now optional and only used to find final tracks and save a playlist.")
+    st.subheader("How it works")
+    st.write("Add 1–8 seed tracks. The recommender compares listening patterns and music tags across your picks, then ranks songs that best match the overall vibe.")
+    st.write("Adjust the playlist size and diversity controls to make the results tighter, broader, or more varied.")
+    st.write("Connect Spotify only if you want to save the final recommendations directly to your account.")
 
 if not LASTFM_API_KEY:
-    st.error("Add LASTFM_API_KEY to your deployment secrets to run recommendations.")
+    st.error("Recommendations are temporarily unavailable because the music data service is not configured.")
     st.stop()
 
 left, right = st.columns([3, 2])
@@ -196,10 +197,10 @@ with right:
 if st.button("Generate recommendations", type="primary"):
     seeds = parse_seeds(seed_text)
     if not seeds:
-        st.error("Use the format `Artist — Track` for at least one seed.")
+        st.error("Add at least one track using the format `Artist — Track`.")
     else:
         try:
-            with st.spinner("Building your recommendation set..."):
+            with st.spinner("Finding tracks that fit your playlist..."):
                 st.session_state["recs"] = recommend(seeds, count, max_artist, diversity)
                 st.session_state.pop("spotify_matches", None)
         except (LastFMError, RuntimeError, ValueError) as exc:
@@ -208,7 +209,7 @@ if st.button("Generate recommendations", type="primary"):
 recs = st.session_state.get("recs", [])
 if recs:
     st.markdown("---")
-    st.subheader("Recommendations")
+    st.subheader("Your recommendations")
     matches = st.session_state.get("spotify_matches", {})
     for i, item in enumerate(recs, 1):
         with st.container(border=True):
@@ -218,24 +219,24 @@ if recs:
                 if item.tags:
                     st.caption(" · ".join(item.tags[:6]))
                 if item.track.url:
-                    st.link_button("Last.fm", item.track.url)
+                    st.link_button("View on Last.fm", item.track.url)
                 match = matches.get(item.track.key)
                 if match:
                     url = (match.get("external_urls") or {}).get("spotify")
                     if url:
                         st.link_button("Open in Spotify", url)
             with c2:
-                st.metric("score", f"{round(item.score * 100)}%")
+                st.metric("Match", f"{round(item.score * 100)}%")
                 st.caption(f"similarity {item.collaborative_score:.2f}\ntags {item.tag_score:.2f}\ncoverage {item.seed_coverage:.2f}")
 
-    st.markdown("### Spotify export")
+    st.markdown("### Save to Spotify")
     sp = spotify_client()
     if sp is None and CLIENT_ID and CLIENT_SECRET and REDIRECT_URI:
         login = oauth(make_state(CLIENT_SECRET)).get_authorize_url()
-        st.link_button("Connect Spotify to save playlist", login)
-        st.caption("Spotify Development Mode only allows accounts added to your app's allowlist.")
+        st.link_button("Connect Spotify", login)
+        st.caption("Connect your Spotify account to save these recommendations as a playlist.")
     elif sp is not None:
-        if st.button("Match recommendations to Spotify"):
+        if st.button("Find these tracks on Spotify"):
             mapped = {}
             progress = st.progress(0)
             for idx, item in enumerate(recs, 1):
@@ -247,22 +248,22 @@ if recs:
                     mapped[item.track.key] = match
                 progress.progress(idx / len(recs))
             st.session_state["spotify_matches"] = mapped
-            st.success(f"Matched {len(mapped)} of {len(recs)} tracks to Spotify.")
+            st.success(f"Found {len(mapped)} of {len(recs)} recommendations on Spotify.")
             st.rerun()
 
         matches = st.session_state.get("spotify_matches", {})
         if matches:
-            name = st.text_input("Playlist name", "Create Similar Playlist · 2026")
-            public = st.checkbox("Public playlist", True)
+            name = st.text_input("Playlist name", "Create Similar Playlist")
+            public = st.checkbox("Make playlist public", True)
             if st.button("Create playlist in Spotify", type="primary"):
                 uris = [matches[x.track.key]["uri"] for x in recs if x.track.key in matches]
                 try:
-                    playlist = sp.current_user_playlist_create(name=name, public=public, description="Generated with hybrid collaborative + tag-based recommendation and diversity reranking.")
+                    playlist = sp.current_user_playlist_create(name=name, public=public, description="Generated from your seed tracks with hybrid similarity and diversity-aware ranking.")
                     sp.playlist_add_items(playlist["id"], uris)
-                    st.success(f"Created playlist with {len(uris)} tracks.")
+                    st.success(f"Your playlist is ready with {len(uris)} tracks.")
                     url = (playlist.get("external_urls") or {}).get("spotify")
                     if url:
-                        st.link_button("Open playlist", url)
+                        st.link_button("Open playlist in Spotify", url)
                 except Exception as exc:
                     st.error(f"Spotify export failed: {exc}")
 
